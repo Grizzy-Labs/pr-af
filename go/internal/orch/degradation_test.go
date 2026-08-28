@@ -249,6 +249,135 @@ func TestAdversaryCannotReturnAnEmptyResultForNonemptyFindings(t *testing.T) {
 	}
 }
 
+func TestAdversaryRetriesOnlyOmittedFindings(t *testing.T) {
+	o := degradationOrchestrator(t)
+	var calls atomic.Int32
+	var retryTitles []string
+	o.rfns.adversary = func(_ context.Context, _ reasoners.Deps, in reasoners.AdversaryInput) (map[string]any, error) {
+		call := calls.Add(1)
+		if call == 1 {
+			return map[string]any{"results": []any{
+				map[string]any{"finding_title": "first", "verdict": "confirmed"},
+			}}, nil
+		}
+		for _, finding := range in.Findings {
+			retryTitles = append(retryTitles, finding.Title)
+		}
+		return map[string]any{"results": []any{
+			map[string]any{"finding_title": "second", "verdict": "challenged"},
+		}}, nil
+	}
+
+	results, err := o.runParallelAdversary(
+		context.Background(),
+		[]schemas.ReviewFinding{{Title: "first"}, {Title: "second"}},
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("adversary calls = %d, want 2", calls.Load())
+	}
+	if got := strings.Join(retryTitles, ","); got != "second" {
+		t.Fatalf("retry titles = %q, want second", got)
+	}
+	if len(results) != 2 || results[0].FindingTitle != "first" || results[1].FindingTitle != "second" {
+		t.Fatalf("results = %+v, want input-title order", results)
+	}
+	_, _, eligible, attempted := o.conditionalPhaseStats()
+	if eligible != 2 || attempted != 2 {
+		t.Fatalf("adversary accounting eligible=%d attempted=%d, want 2/2", eligible, attempted)
+	}
+}
+
+func TestAdversaryFailsAfterOneIncompleteRecovery(t *testing.T) {
+	o := degradationOrchestrator(t)
+	var calls atomic.Int32
+	o.rfns.adversary = func(context.Context, reasoners.Deps, reasoners.AdversaryInput) (map[string]any, error) {
+		calls.Add(1)
+		return map[string]any{"results": []any{}}, nil
+	}
+
+	_, err := o.runParallelAdversary(
+		context.Background(),
+		[]schemas.ReviewFinding{{Title: "still missing"}},
+		nil,
+		nil,
+	)
+	if err == nil || !strings.Contains(err.Error(), "omitted finding") {
+		t.Fatalf("runParallelAdversary error = %v", err)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("adversary calls = %d, want 2", calls.Load())
+	}
+}
+
+func TestAdversaryDoesNotRetryAfterDurationBudgetExpires(t *testing.T) {
+	o := degradationOrchestrator(t)
+	o.config.Budget.MaxDurationSeconds = 1
+	var calls atomic.Int32
+	o.clock = func() time.Duration {
+		if calls.Load() == 0 {
+			return 0
+		}
+		return 2 * time.Second
+	}
+	o.rfns.adversary = func(context.Context, reasoners.Deps, reasoners.AdversaryInput) (map[string]any, error) {
+		calls.Add(1)
+		return map[string]any{"results": []any{}}, nil
+	}
+
+	_, err := o.runParallelAdversary(
+		context.Background(),
+		[]schemas.ReviewFinding{{Title: "duration limited"}},
+		nil,
+		nil,
+	)
+	if err == nil || !strings.Contains(err.Error(), "Review time budget exceeded") {
+		t.Fatalf("runParallelAdversary error = %v", err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("adversary calls = %d, want 1", calls.Load())
+	}
+}
+
+func TestAdversarySiblingCancellationPreventsRecoveryCall(t *testing.T) {
+	o := degradationOrchestrator(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	secondBatchStarted := make(chan struct{})
+	var secondBatchCalls atomic.Int32
+	o.rfns.adversary = func(ctx context.Context, _ reasoners.Deps, in reasoners.AdversaryInput) (map[string]any, error) {
+		if in.Findings[0].Title == "first-0" {
+			select {
+			case <-secondBatchStarted:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+			return nil, errors.New("sibling failed")
+		}
+		if secondBatchCalls.Add(1) == 1 {
+			close(secondBatchStarted)
+			<-ctx.Done()
+		}
+		return map[string]any{"results": []any{}}, nil
+	}
+	findings := make([]schemas.ReviewFinding, adversaryBatchSize+1)
+	for i := 0; i < adversaryBatchSize; i++ {
+		findings[i].Title = fmt.Sprintf("first-%d", i)
+	}
+	findings[adversaryBatchSize].Title = "second-batch"
+
+	if _, err := o.runParallelAdversary(ctx, findings, nil, nil); err == nil {
+		t.Fatal("runParallelAdversary unexpectedly succeeded")
+	}
+	if secondBatchCalls.Load() != 1 {
+		t.Fatalf("cancelled sibling calls = %d, want 1", secondBatchCalls.Load())
+	}
+}
+
 func TestAdversaryFailsWhenTheBatchCapWouldOmitFindings(t *testing.T) {
 	o := degradationOrchestrator(t)
 	findings := make([]schemas.ReviewFinding, adversaryBatchSize*maxAdversaryBatch+1)
@@ -301,6 +430,128 @@ func TestEvidenceVerifierCannotReturnAnEmptyResultForEligibleFindings(t *testing
 	)
 	if err == nil || !strings.Contains(err.Error(), "omitted finding") {
 		t.Fatalf("runEvidenceVerification error = %v", err)
+	}
+}
+
+func TestEvidenceVerifierRetriesOnlyOmittedFindings(t *testing.T) {
+	o := degradationOrchestrator(t)
+	var calls atomic.Int32
+	var retryTitles []string
+	o.rfns.evidenceVerify = func(_ context.Context, _ reasoners.Deps, in reasoners.EvidenceVerifierInput) (map[string]any, error) {
+		call := calls.Add(1)
+		if call == 1 {
+			return map[string]any{"verified_findings": []any{
+				map[string]any{"title": "first", "verified": true},
+			}}, nil
+		}
+		for _, finding := range in.Findings {
+			retryTitles = append(retryTitles, finding.Title)
+		}
+		return map[string]any{"verified_findings": []any{
+			map[string]any{"title": "second", "verified": false, "revised_severity": "suggestion"},
+		}}, nil
+	}
+	findings := []schemas.ReviewFinding{
+		{Title: "first", Severity: "critical"},
+		{Title: "second", Severity: "important"},
+	}
+
+	updated, verificationMap, err := o.runEvidenceVerification(context.Background(), findings, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("evidence verifier calls = %d, want 2", calls.Load())
+	}
+	if got := strings.Join(retryTitles, ","); got != "second" {
+		t.Fatalf("retry titles = %q, want second", got)
+	}
+	if len(verificationMap) != 2 {
+		t.Fatalf("verification map = %+v, want both findings", verificationMap)
+	}
+	if updated[1].Severity != "suggestion" {
+		t.Fatalf("updated second severity = %q, want suggestion", updated[1].Severity)
+	}
+	eligible, attempted, _, _ := o.conditionalPhaseStats()
+	if eligible != 2 || attempted != 2 {
+		t.Fatalf("evidence accounting eligible=%d attempted=%d, want 2/2", eligible, attempted)
+	}
+}
+
+func TestEvidenceVerifierFailsAfterOneIncompleteRecovery(t *testing.T) {
+	o := degradationOrchestrator(t)
+	var calls atomic.Int32
+	o.rfns.evidenceVerify = func(context.Context, reasoners.Deps, reasoners.EvidenceVerifierInput) (map[string]any, error) {
+		calls.Add(1)
+		return map[string]any{"verified_findings": []any{}}, nil
+	}
+
+	_, _, err := o.runEvidenceVerification(
+		context.Background(),
+		[]schemas.ReviewFinding{{Title: "still missing", Severity: "important"}},
+		nil,
+	)
+	if err == nil || !strings.Contains(err.Error(), "omitted finding") {
+		t.Fatalf("runEvidenceVerification error = %v", err)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("evidence verifier calls = %d, want 2", calls.Load())
+	}
+}
+
+func TestEvidenceVerifierCancellationPreventsRecoveryCall(t *testing.T) {
+	o := degradationOrchestrator(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	var calls atomic.Int32
+	o.rfns.evidenceVerify = func(context.Context, reasoners.Deps, reasoners.EvidenceVerifierInput) (map[string]any, error) {
+		calls.Add(1)
+		cancel()
+		return map[string]any{"verified_findings": []any{}}, nil
+	}
+
+	_, _, err := o.runEvidenceVerification(
+		ctx,
+		[]schemas.ReviewFinding{{Title: "cancelled", Severity: "important"}},
+		nil,
+	)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("runEvidenceVerification error = %v, want context canceled", err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("evidence verifier calls = %d, want 1", calls.Load())
+	}
+}
+
+func TestEvidenceVerifierDoesNotRetryAfterDurationBudgetExpires(t *testing.T) {
+	o := degradationOrchestrator(t)
+	o.config.Budget.MaxDurationSeconds = 1
+	var calls atomic.Int32
+	o.clock = func() time.Duration {
+		if calls.Load() == 0 {
+			return 0
+		}
+		return 2 * time.Second
+	}
+	o.rfns.evidenceVerify = func(context.Context, reasoners.Deps, reasoners.EvidenceVerifierInput) (map[string]any, error) {
+		calls.Add(1)
+		return map[string]any{"verified_findings": []any{
+			map[string]any{"title": "first", "verified": true},
+		}}, nil
+	}
+
+	_, _, err := o.runEvidenceVerification(
+		context.Background(),
+		[]schemas.ReviewFinding{
+			{Title: "first", Severity: "important"},
+			{Title: "second", Severity: "important"},
+		},
+		nil,
+	)
+	if err == nil || !strings.Contains(err.Error(), "Review time budget exceeded") {
+		t.Fatalf("runEvidenceVerification error = %v", err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("evidence verifier calls = %d, want 1", calls.Load())
 	}
 }
 

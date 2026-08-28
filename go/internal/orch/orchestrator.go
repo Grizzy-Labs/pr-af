@@ -124,8 +124,9 @@ var enabledLenses = []string{"semantic", "mechanical", "systemic"}
 var progressTagValuePattern = regexp.MustCompile(`^[A-Za-z0-9_.:-]+$`)
 
 const (
-	adversaryBatchSize = 5
-	maxAdversaryBatch  = 4
+	adversaryBatchSize         = 5
+	maxAdversaryBatch          = 4
+	incompleteResultRetryLimit = 1
 )
 
 // Orchestrator holds one review's state and seams. New wires the default

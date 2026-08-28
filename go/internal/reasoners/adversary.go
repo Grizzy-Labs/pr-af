@@ -2,6 +2,7 @@ package reasoners
 
 import (
 	"context"
+	"os"
 	"unicode/utf8"
 
 	"github.com/Agent-Field/agentfield/sdk/go/harness"
@@ -22,15 +23,20 @@ func AdversaryPhase(ctx context.Context, deps Deps, in AdversaryInput) (map[stri
 
 	// The builder embeds a file reference when the findings JSON (first 20
 	// findings) exceeds 10000 characters and a repo path exists; the write is
-	// the reasoner's job.
+	// the reasoner's job. Each call gets its own immutable snapshot because
+	// adversary batches run concurrently against the same repository.
 	summary := adversaryContext(in.Findings, evMap)
+	findingsPath := ""
 	if utf8.RuneCountInString(summary) > 10000 && in.RepoPath != "" {
-		if _, err := writeContextFile(summary, "adversary_findings.json", in.RepoPath); err != nil {
+		var err error
+		findingsPath, err = writeUniqueContextFile(summary, "adversary_findings_*.json", in.RepoPath)
+		if err != nil {
 			return nil, err
 		}
+		defer func() { _ = os.Remove(findingsPath) }()
 	}
 
-	prompt := prompts.AdversaryPrompt(in.Findings, in.AIGeneratedConfidence, in.PrContext, in.RepoPath, evMap)
+	prompt := prompts.AdversaryPrompt(in.Findings, in.AIGeneratedConfidence, in.PrContext, findingsPath, evMap)
 	parsed, _, err := harnessx.Run[adversaryPhaseResult](ctx, deps.Harness, prompt, harness.Options{Cwd: in.RepoPath})
 	if err != nil {
 		return nil, err
