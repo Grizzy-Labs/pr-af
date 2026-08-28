@@ -60,8 +60,10 @@ const adversaryMiddle = "## For Each Finding, Determine:\n\n" +
 
 // AdversaryPrompt ports adversary_phase. Skepticism escalates to "high" when the
 // AI-generated confidence exceeds 0.5; the extra skepticism line appears on the
-// same condition. has_evidence is bool(evidenceMap).
-func AdversaryPrompt(findings []schemas.ReviewFinding, aiGeneratedConfidence float64, prContext, repoPath string, evidenceMap map[string]*OMap) string {
+// same condition. has_evidence is bool(evidenceMap). findingsPath identifies the
+// immutable context snapshot written for this harness call when the summary is
+// too large to embed.
+func AdversaryPrompt(findings []schemas.ReviewFinding, aiGeneratedConfidence float64, prContext, findingsPath string, evidenceMap map[string]*OMap) string {
 	skepticism := "standard"
 	if aiGeneratedConfidence > 0.5 {
 		skepticism = "high"
@@ -93,9 +95,8 @@ func AdversaryPrompt(findings []schemas.ReviewFinding, aiGeneratedConfidence flo
 	summary := pyJSON(withEvidence)
 
 	var findingsRef string
-	if utf8.RuneCountInString(summary) > 10000 && repoPath != "" {
-		fp := contextPath(repoPath, ".pr-af-context", "adversary_findings.json")
-		findingsRef = "Full findings with ground-truth evidence written to: " + fp + "\n" +
+	if utf8.RuneCountInString(summary) > 10000 && findingsPath != "" {
+		findingsRef = "Full findings with ground-truth evidence written to: " + findingsPath + "\n" +
 			"Read this file for complete finding details and code evidence."
 	} else {
 		findingsRef = "Findings with ground-truth evidence:\n" + summary

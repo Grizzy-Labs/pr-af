@@ -102,6 +102,33 @@ func writeContextFile(content, name, repoPath string) (string, error) {
 	return path, nil
 }
 
+// writeUniqueContextFile writes one immutable context snapshot under
+// <repo>/.pr-af-context using pattern. A unique path prevents concurrent
+// harness calls from reading another call's context while sharing a repo.
+func writeUniqueContextFile(content, pattern, repoPath string) (path string, err error) {
+	ctxDir := filepath.Join(repoPath, ".pr-af-context")
+	if err := os.MkdirAll(ctxDir, 0o777); err != nil {
+		return "", err
+	}
+	file, err := os.CreateTemp(ctxDir, pattern)
+	if err != nil {
+		return "", err
+	}
+	path = file.Name()
+	defer func() {
+		if closeErr := file.Close(); err == nil && closeErr != nil {
+			err = closeErr
+		}
+		if err != nil {
+			_ = os.Remove(path)
+		}
+	}()
+	if _, err = file.WriteString(content); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
 // areaPair keeps _extract_areas' area_patterns insertion order (the detected
 // list is emitted in this order).
 type areaPair struct {

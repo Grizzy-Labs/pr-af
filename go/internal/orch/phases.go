@@ -727,45 +727,45 @@ func (o *Orchestrator) runEvidenceVerification(
 		return nil, nil, fmt.Errorf("evidence verification received duplicate finding title %q", title)
 	}
 
-	evPackages := map[string]map[string]any{}
-	for _, f := range highPriority {
-		if pkg, ok := evidenceMap[f.Title]; ok {
-			evPackages[f.Title] = evidencePackToMap(pkg)
-		}
-	}
-	var evArg map[string]map[string]any
-	if len(evPackages) > 0 {
-		evArg = evPackages
-	}
 	o.recordEvidenceVerification(len(highPriority), len(highPriority))
 
-	raw, err := o.rfns.evidenceVerify(ctx, o.reasonerDeps(), reasoners.EvidenceVerifierInput{
-		Findings:         highPriority,
-		EvidencePackages: evArg,
-		PrContext:        o.buildPRContextString(),
-		RepoPath:         strp(o.input.RepoPath),
-	})
-	if err != nil {
-		return nil, nil, err
-	}
-	o.incInvocations(1)
-	o.registerCost("evidence_verification", raw)
-
 	verificationMap := map[string]map[string]any{}
-	verificationCounts := map[string]int{}
-	for _, vf := range asObjListStrict(raw, "verified_findings") {
-		title := getStr(vf, "title", "")
-		if title == "" {
-			continue
+	remaining := highPriority
+	for attempt := 0; attempt <= incompleteResultRetryLimit && len(remaining) > 0; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
 		}
-		verificationCounts[title]++
-		verificationMap[title] = vf
+		if o.budgetOrTimeoutExhausted("evidence_verification") {
+			return nil, nil, budgetExhaustedErr(o.budgetExhaustedMessage("evidence verification"))
+		}
+		evArg := evidencePackagesForFindings(remaining, evidenceMap)
+		raw, err := o.rfns.evidenceVerify(ctx, o.reasonerDeps(), reasoners.EvidenceVerifierInput{
+			Findings:         remaining,
+			EvidencePackages: evArg,
+			PrContext:        o.buildPRContextString(),
+			RepoPath:         strp(o.input.RepoPath),
+		})
+		if err != nil {
+			return nil, nil, err
+		}
+		o.incInvocations(1)
+		o.registerCost("evidence_verification", raw)
+
+		expected := findingTitleSet(remaining)
+		for _, vf := range asObjListStrict(raw, "verified_findings") {
+			title := getStr(vf, "title", "")
+			if _, wanted := expected[title]; !wanted {
+				continue
+			}
+			if _, alreadyCollected := verificationMap[title]; alreadyCollected {
+				continue
+			}
+			verificationMap[title] = vf
+		}
+		remaining = findingsMissingFromMap(highPriority, verificationMap)
 	}
-	for _, finding := range highPriority {
-		if verificationCounts[finding.Title] == 0 {
-			return nil, nil, fmt.Errorf("evidence verification omitted finding %q", finding.Title)
-		}
-		verificationCounts[finding.Title]--
+	if len(remaining) > 0 {
+		return nil, nil, fmt.Errorf("evidence verification omitted finding %q after one recovery attempt", remaining[0].Title)
 	}
 	o.markPhaseCompleted("evidence_verification")
 
@@ -856,52 +856,11 @@ func (o *Orchestrator) runParallelAdversary(
 			}
 			batch := batches[i]
 			o.recordAdversaryAttempt(len(batch))
-			batchEvidence := map[string]map[string]any{}
-			for _, f := range batch {
-				entry := map[string]any{}
-				if pkg, ok := evidenceMap[f.Title]; ok {
-					entry = evidencePackToMap(pkg)
-				}
-				if vf, ok := verificationMap[f.Title]; ok {
-					entry["verification"] = map[string]any{
-						"verified":           mapGet(vf, "verified", true),
-						"actual_behavior":    getStr(vf, "actual_behavior", ""),
-						"verification_notes": getStr(vf, "verification_notes", ""),
-					}
-				}
-				if len(entry) > 0 {
-					batchEvidence[f.Title] = entry
-				}
+			batchResults, err := o.runAdversaryBatch(gctx, batch, evidenceMap, verificationMap, aiConfidence)
+			if err == nil {
+				results[i] = batchResults
 			}
-			var evArg map[string]map[string]any
-			if len(batchEvidence) > 0 {
-				evArg = batchEvidence
-			}
-			raw, err := o.rfns.adversary(gctx, o.reasonerDeps(), reasoners.AdversaryInput{
-				Findings:              batch,
-				AIGeneratedConfidence: aiConfidence,
-				PrContext:             o.buildPRContextString(),
-				RepoPath:              strp(o.input.RepoPath),
-				EvidencePackages:      evArg,
-			})
-			if err != nil {
-				return err
-			}
-			o.incInvocations(1)
-			o.registerCost("adversary", raw)
-			batchResults := extractAdversaryResults(raw)
-			resultTitleCounts := make(map[string]int, len(batchResults))
-			for _, result := range batchResults {
-				resultTitleCounts[result.FindingTitle]++
-			}
-			for _, finding := range batch {
-				if resultTitleCounts[finding.Title] == 0 {
-					return fmt.Errorf("adversary analysis omitted finding %q", finding.Title)
-				}
-				resultTitleCounts[finding.Title]--
-			}
-			results[i] = batchResults
-			return nil
+			return err
 		})
 	}
 	if err := g.Wait(); err != nil {
@@ -913,6 +872,148 @@ func (o *Orchestrator) runParallelAdversary(
 		all = append(all, br...)
 	}
 	return all, nil
+}
+
+// runAdversaryBatch retries only omitted findings once, then restores the
+// original batch order so a partial structured response cannot silently drop
+// or reorder a verdict.
+func (o *Orchestrator) runAdversaryBatch(
+	ctx context.Context,
+	batch []schemas.ReviewFinding,
+	evidenceMap map[string]evidence.EvidencePackage,
+	verificationMap map[string]map[string]any,
+	aiConfidence float64,
+) ([]schemas.AdversaryResult, error) {
+	resultsByTitle := make(map[string]schemas.AdversaryResult, len(batch))
+	remaining := batch
+	for attempt := 0; attempt <= incompleteResultRetryLimit && len(remaining) > 0; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if o.budgetOrTimeoutExhausted("adversary") {
+			return nil, budgetExhaustedErr(o.budgetExhaustedMessage("adversary analysis"))
+		}
+		raw, err := o.rfns.adversary(ctx, o.reasonerDeps(), reasoners.AdversaryInput{
+			Findings:              remaining,
+			AIGeneratedConfidence: aiConfidence,
+			PrContext:             o.buildPRContextString(),
+			RepoPath:              strp(o.input.RepoPath),
+			EvidencePackages:      adversaryEvidenceForFindings(remaining, evidenceMap, verificationMap),
+		})
+		if err != nil {
+			return nil, err
+		}
+		o.incInvocations(1)
+		o.registerCost("adversary", raw)
+
+		expected := findingTitleSet(remaining)
+		for _, result := range extractAdversaryResults(raw) {
+			if _, wanted := expected[result.FindingTitle]; !wanted {
+				continue
+			}
+			if _, alreadyCollected := resultsByTitle[result.FindingTitle]; alreadyCollected {
+				continue
+			}
+			resultsByTitle[result.FindingTitle] = result
+		}
+		remaining = findingsMissingFromAdversaryResults(batch, resultsByTitle)
+	}
+	if len(remaining) > 0 {
+		return nil, fmt.Errorf("adversary analysis omitted finding %q after one recovery attempt", remaining[0].Title)
+	}
+
+	ordered := make([]schemas.AdversaryResult, 0, len(batch))
+	for _, finding := range batch {
+		ordered = append(ordered, resultsByTitle[finding.Title])
+	}
+	return ordered, nil
+}
+
+// evidencePackagesForFindings returns only evidence belonging to the current
+// evidence-verifier request. nil preserves the reasoner's optional contract.
+func evidencePackagesForFindings(
+	findings []schemas.ReviewFinding,
+	evidenceMap map[string]evidence.EvidencePackage,
+) map[string]map[string]any {
+	packages := make(map[string]map[string]any, len(findings))
+	for _, finding := range findings {
+		if pkg, ok := evidenceMap[finding.Title]; ok {
+			packages[finding.Title] = evidencePackToMap(pkg)
+		}
+	}
+	if len(packages) == 0 {
+		return nil
+	}
+	return packages
+}
+
+// adversaryEvidenceForFindings returns only evidence and verification data for
+// the current adversary request. nil preserves the reasoner's optional contract.
+func adversaryEvidenceForFindings(
+	findings []schemas.ReviewFinding,
+	evidenceMap map[string]evidence.EvidencePackage,
+	verificationMap map[string]map[string]any,
+) map[string]map[string]any {
+	packages := make(map[string]map[string]any, len(findings))
+	for _, finding := range findings {
+		entry := map[string]any{}
+		if pkg, ok := evidenceMap[finding.Title]; ok {
+			entry = evidencePackToMap(pkg)
+		}
+		if vf, ok := verificationMap[finding.Title]; ok {
+			entry["verification"] = map[string]any{
+				"verified":           mapGet(vf, "verified", true),
+				"actual_behavior":    getStr(vf, "actual_behavior", ""),
+				"verification_notes": getStr(vf, "verification_notes", ""),
+			}
+		}
+		if len(entry) > 0 {
+			packages[finding.Title] = entry
+		}
+	}
+	if len(packages) == 0 {
+		return nil
+	}
+	return packages
+}
+
+// findingTitleSet returns the unambiguous title identities for one request.
+func findingTitleSet(findings []schemas.ReviewFinding) map[string]struct{} {
+	titles := make(map[string]struct{}, len(findings))
+	for _, finding := range findings {
+		titles[finding.Title] = struct{}{}
+	}
+	return titles
+}
+
+// findingsMissingFromMap preserves input order while selecting findings whose
+// title has not received an evidence-verification result.
+func findingsMissingFromMap(
+	findings []schemas.ReviewFinding,
+	results map[string]map[string]any,
+) []schemas.ReviewFinding {
+	missing := make([]schemas.ReviewFinding, 0)
+	for _, finding := range findings {
+		if _, found := results[finding.Title]; !found {
+			missing = append(missing, finding)
+		}
+	}
+	return missing
+}
+
+// findingsMissingFromAdversaryResults preserves input order while selecting
+// findings whose title has not received an adversary verdict.
+func findingsMissingFromAdversaryResults(
+	findings []schemas.ReviewFinding,
+	results map[string]schemas.AdversaryResult,
+) []schemas.ReviewFinding {
+	missing := make([]schemas.ReviewFinding, 0)
+	for _, finding := range findings {
+		if _, found := results[finding.Title]; !found {
+			missing = append(missing, finding)
+		}
+	}
+	return missing
 }
 
 // duplicateFindingTitle detects ambiguous title-based identities before phases

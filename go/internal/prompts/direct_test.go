@@ -122,7 +122,8 @@ func TestAdversaryGolden(t *testing.T) {
 	assertGolden(t, "adversary_A", AdversaryPrompt([]schemas.ReviewFinding{findingFix(nil)}, 0.7, "PR adds retry.", "", advpk))
 	assertGolden(t, "adversary_B", AdversaryPrompt([]schemas.ReviewFinding{findingFix(nil)}, 0.0, "", "", nil))
 	assertGolden(t, "adversary_C", AdversaryPrompt(
-		[]schemas.ReviewFinding{findingFix(func(f *schemas.ReviewFinding) { f.Body = bigFiller("bd", 11000) })}, 0.3, "", fixtureRepo, nil))
+		[]schemas.ReviewFinding{findingFix(func(f *schemas.ReviewFinding) { f.Body = bigFiller("bd", 11000) })},
+		0.3, "", contextPath(fixtureRepo, ".pr-af-context", "adversary_findings.json"), nil))
 }
 
 func TestDeepenGolden(t *testing.T) {
